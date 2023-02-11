@@ -191,12 +191,13 @@ rzoib <- function(n,alpha,gamma,b1,b2){
   return(ZOIB)
 }
 set.seed(42)
+plot(
 ggplot(,aes(x=rzoib(n,alpha,gamma,b1,b2)))+
   geom_density(fill="navy",color="black",alpha=.3)+
   theme_minimal()+
   labs(x="",y="",title = "Zero One Inflated Beta")+
   theme(axis.text.y=element_blank(),
-        axis.ticks.y=element_blank())
+        axis.ticks.y=element_blank()))
 ```
 
 ![](Curtailments_files/figure-gfm/zoibExample-1.png)<!-- -->
@@ -501,7 +502,7 @@ very similar characteristics.
 ### Traceplots Mean Function (Beta)
 
 ``` r
-trace_plot(Mu_posterior)
+plot(trace_plot(Mu_posterior))
 ```
 
 ![](Curtailments_files/figure-gfm/tracePlot-1.png)<!-- -->
@@ -509,7 +510,7 @@ trace_plot(Mu_posterior)
 ### Density Mean Function (Beta)
 
 ``` r
-density_plot(Mu_posterior)
+plot(density_plot(Mu_posterior))
 ```
 
 ![](Curtailments_files/figure-gfm/densityPlot-1.png)<!-- -->
@@ -675,13 +676,13 @@ Y_ppd_s <- as.data.frame(Y_ppd[,1:100])%>%
   mutate(Maturity = DF_train$Maturity)%>%
   pivot_longer(!Maturity)
 
-  ggplot()+
+  plot(ggplot()+
   geom_density(data=Y_ppd_s,aes(x=value,color=name),alpha=0.5,size=0.5)+
   geom_density(aes(x=DF_train$SMM),alpha=0.5,size=0.5,color="red")+
   theme_minimal()+
   scale_color_manual(values=rep("gray",100))+
   theme(legend.position = "none")+
-  labs(title="Posterior Predictive Distribution, SMM",x="",y="")
+  labs(title="Posterior Predictive Distribution, SMM",x="",y=""))
 ```
 
 ![](Curtailments_files/figure-gfm/fitPerformance-1.png)<!-- -->
@@ -692,14 +693,14 @@ the observed prepayment curve with the curve from the mean PPD. Both are
 quite noisy, but are very similar.
 
 ``` r
-DF_train%>%
+plot(DF_train%>%
   transmute(Maturity,SMM,PPD=Y_ppd_mean)%>%
   group_by(Maturity)%>%
   summarise_all(mean)%>%
   pivot_longer(!Maturity)%>%
   ggplot()+geom_line(aes(x=Maturity,color=name,y=value))+
   theme_minimal()+
-  labs(x="",y="",color="",title = "Prepayment Curve 2015-2017")
+  labs(x="",y="",color="",title = "Prepayment Curve 2015-2017"))
 ```
 
 ![](Curtailments_files/figure-gfm/fitPPC-1.png)<!-- -->
@@ -719,13 +720,13 @@ Y_ppd_fc_s <- as.data.frame(Y_ppd_fc[,1:100])%>%
   mutate(Maturity = DF_test$Maturity)%>%
   pivot_longer(!Maturity)
 
-  ggplot()+
+  plot(ggplot()+
   geom_density(data=Y_ppd_fc_s,aes(x=value,color=name),alpha=0.5,size=0.5)+
   geom_density(aes(x=DF_test$SMM),alpha=0.5,size=0.5,color="red")+
   theme_minimal()+
   scale_color_manual(values=rep("gray",100))+
   theme(legend.position = "none")+
-  labs(title="Posterior Predictive Distribution 2018, SMM",x="",y="")
+  labs(title="Posterior Predictive Distribution 2018, SMM",x="",y=""))
 ```
 
 ![](Curtailments_files/figure-gfm/PPD2018-1.png)<!-- -->
@@ -735,14 +736,14 @@ prepayment curve of that year. Again, we can see that the predictions
 are not perfect, but they do a good job on predicting the future.
 
 ``` r
-DF_test%>%
+plot(DF_test%>%
   transmute(Maturity,SMM,PPD=Y_ppd_mean_fc)%>%
   group_by(Maturity)%>%
   summarise_all(mean)%>%
   pivot_longer(!Maturity)%>%
   ggplot()+geom_line(aes(x=Maturity,color=name,y=value))+
   theme_minimal()+
-  labs(x="",y="",color="",title = "Prepayment Curve 2018")
+  labs(x="",y="",color="",title = "Prepayment Curve 2018"))
 ```
 
 ![](Curtailments_files/figure-gfm/predPPC-1.png)<!-- -->

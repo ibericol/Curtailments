@@ -1,0 +1,525 @@
+---
+title: "Curtailments"
+author: "Luis Iberico"
+date: "2023-01-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,cache=FALSE, results=T, warning=FALSE, comment=FALSE)
+```
+
+```{r }
+require(rstan)
+require(tidyverse)
+require(gtools)
+require(forecast)
+rm(list=ls())
+
+load("data.Rda")
+load("TestData.Rda")
+```
+
+# Introduction
+
+In this sample project I will show how to build a model for Mortgage Curtailments, and proceed with the estimation of a prepayment curve. The model will be trained using data from 2015 up to 2017, and tested using data from 2018. In banking, the prepayment or behavioral curve is one of the principal components in the Transfer Pricing (TP) -the price that the treasury charges the business for the savings-. The TP is also one of the principal components in the pricing -the price that the Bank charges the clients-. I will use a sample of real data from a bank that I wont disclose. Curtailments have a weird distribution. It has a high concentration of 0's, a smaller concentration of 1's, and some density in between. The model that I chose is the Zero One Inflated Beta, which models the empirical distribution very well. The model is estimated in stan (rstan package for r) and follows Ospina and Ferrari 2010.
+
+
+# Data Description
+
+The data that I am using has 14 features and one target (SMM), and has information on every transaction of each mid to high income clients between 2015 and 2017. Now, I will give a brief description of each variable. The variables were previously chosen according to banking experts and correlation analysis.
+
+* Salary: Monthly salary in PEN (national currency).
+* Age: Age (in years) of the client.
+* QProd: Total number of products that the client holds.
+* ActBal: Active Balance is the total amount of loan that a client holds.
+* PassBal: Passive Balance is the total amount of savings that a client holds.
+* SOW: Share of Wallet is the proportion (%) of loans that the client holds in this bank with respect to the complete banking system.
+* Loan: Total amount of the mortgage loan.
+* Rate: Rate of the mortgage loan.
+* Maturity: Time (in months) since the start of the mortgage loan.
+* Maturity2: Squared maturity.
+* DD: The Domestic Demand measures the annualized growth in economic activity of the country (Private and Public expenditure). 
+* CPI: Consumer Price Index measures the annualized increment in prices.
+* HPI: House Price Index measures the annualized increment in housing prices.
+* Date: year-month.
+* SMM: Curtailments measured as Single Monthly Mortality (SMM) rate. The SMM will be introduced in the next section.
+
+Here is a table that will help understand the structure of the data.
+
+```{r varlist}
+str(DF_train)
+
+```
+
+# Curtailments
+
+A curtailment is any additional payment that clients make on their mortgage loans. There are two types of curtailments: partial curtailment and full curtailment. A full curtailment means the client payed the full loan. Also, a curtailment can aim to reduce the terms of the loan, or to decrease the monthly payment. This affects the estimation of the Transfer Pricing, but we will ignore them in sake of simplicity.
+
+In this project we measure the curtailment as the Single Monthly Mortality. This is a ratio of the monthly prepayment by the principal. You can find more information on this ratio in [investopedia](https://www.investopedia.com/terms/p/principal.asp).
+
+In short, SMM takes the value of 0 if there is no curtailment, 1 if there is a full curtailment, and some number between 0 and 1 if there is a partial curtailment. In practice, not many clients make partial curtailments, and even less clients make full curtailments, so we have a high concentration of 0's in the distribution. After doing some research, I came upon a mixture model that can represent this distribution. This model is known as the Zero One Inflated Beta or ZOIB model.
+
+# ZOIB Model
+
+This model consist of a beta model inflated in 0 and 1. This is a mixture model of 3 processes. The first process distinguish if the value is categorical (0 or 1) or continuous (0,1), a binomial density. The second process distinguish if the value, given that its a categorical number, is 0 or 1, another binomial density. And the third process estimates the beta density for the continuous part. Each process can be understood as a model on its own, and this three models run simultaneously, each with its own predictors. For simplicity, I will use the same predictors on each mixture. a great paper with much more information on ZOIB and ZIB models is this one [Opsina & Ferrari 2010](http://dx.doi.org/10.1007/s00362-008-0125-4).
+
+As an example, lets sample from a ZOIB distribution. Let $\alpha$ be the mean parameter for the first binomial component (categorical or continuous), $\gamma$ is the mean parameter for the second binomial component (0 or 1), and $[b_1, b_2]$ the shape parameters of the beta component. The empirical distribution or curtailments has a high concentration of values around 0, so we set $\alpha = 0.7$. The amount of full curtailments is very low, but noticeable, so we set $\gamma = 0.1$. Finally, we have a beta (1,2) distribution.
+
+```{r zoibExample}
+n <- 1000
+alpha <- 0.7
+gamma <- 0.1
+b1 <- 1
+b2 <- 2
+rzoib <- function(n,alpha,gamma,b1,b2){
+  categorical <- rbinom(n,1,alpha)
+  one <- rbinom(n,1,gamma)
+  ZOIB = rbeta(n,b1,b2)
+  ZOIB[categorical*one==1] <- 1
+  ZOIB[categorical==1&one==0] <- 0
+  return(ZOIB)
+}
+set.seed(42)
+ggplot(,aes(x=rzoib(n,alpha,gamma,b1,b2)))+
+  geom_density(fill="navy",color="black",alpha=.3)+
+  theme_minimal()+
+  labs(x="",y="",title = "Zero One Inflated Beta")+
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+
+
+
+
+```
+
+# Model Fit
+
+The stan code for this ZOIB models is quite large because we have several parameters, and we also want to test the out of sample performance of the model, so we have add that to the sampler. I will break it down in 5 parts.
+
+## Data
+
+Here we declare all the data objects that we are going to use. We need to declare the number of observations (N), the number of features (F), the feature matrix (X), and the target (Y). Also, for the out of sample prediction, we specify the same arguments excluding Y.
+
+## Parameters
+
+Here we declare all the priors and hyper priors that we will use. For each parameter of all the components (4 in total) we specify the gamma and tau hyper priors, and a set of priors for the coefficients. We have 4 components in total: alpha for the mean of the first binomial component, gamma for the mean of the second binomial component, mu for the mean of the beta distribution, and phi for the precision parameter of the beta distribution. It is easier to think of a model on the mean rather than the scale parameters, so we set the model like this and re-parametrise later on.
+
+## Transformed Parameters
+
+Here we declare and calculate the parameters alpha (from the first binomial component), gamma (from the second binomial component), mu (mean of beta), phi (precision of beta), p (first scale of beta), and q (second scale of beta). It is worth noticing that the first three components and the mean of the beta are estimated with a logit link, and the precision is estimated with a log link. The inverse of the link functions are used to estimated the parameters. This is done for the fit and the out of sample prediction.
+
+## Model
+
+Here we populate the hyper priors and priors, and estimate the ZOIB model.
+
+## Generated Quantities
+
+Here we sample Y_fit from the posterior predictive distribution, and we also sample Y_pred which is the output of sample prediction.
+
+```{r stanModel}
+ZOIB <- "
+data {
+  // Fit
+  int N;  // N of Obs
+  int F;  // N of Features
+  matrix[N,F] X; // Matrix of Features
+  vector<lower=0, upper=1>[N] Y;
+  // Predict
+  int N_pred;  // N of Obs
+  int F_pred;  // N of Features
+  matrix[N_pred,F_pred] X_pred; // Matrix of Features
+
+}
+
+parameters {
+  // Hyper Priors
+  vector[F] gamma;
+  vector<lower=0>[F] tau;
+  
+  // alpha function
+  vector[F] coef_a; //population-level regression coefficients
+
+  // gamma function
+  vector[F] coef_g; //population-level regression coefficients
+
+  // mu function
+  vector[F] coef_m; //population-level regression coefficients
+
+  // phi function
+  vector[F] coef_p; //population-level regression coefficients
+}
+
+transformed parameters {
+  // Fit
+  vector<lower=0, upper=1>[N] p1;
+  vector<lower=0, upper=1>[N] p2;
+  vector[N] mu;
+  vector<lower=0>[N] phi;
+  vector<lower=0>[N] p;
+  vector<lower=0>[N] q;
+  
+  // Predict
+  vector<lower=0, upper=1>[N_pred] p1_pred;
+  vector<lower=0, upper=1>[N_pred] p2_pred;
+  vector[N_pred] mu_pred;
+  vector<lower=0>[N_pred] phi_pred;
+  vector<lower=0>[N_pred] p_pred;
+  vector<lower=0>[N_pred] q_pred;
+
+  // Compute the linear predictor using relevant group-level regression coefficients
+  
+    // Fit
+    p1 = inv_logit(X * coef_a);
+    p2 = inv_logit(X * coef_g);
+    mu = inv_logit(X * coef_m);
+    phi = exp(X * coef_p);
+    p = mu .* phi;
+    q = phi - mu .* phi;
+    
+    // Pred
+    p1_pred = inv_logit(X_pred * coef_a);
+    p2_pred = inv_logit(X_pred * coef_g);
+    mu_pred = inv_logit(X_pred * coef_m);
+    phi_pred = exp(X_pred * coef_p);
+    p_pred = mu_pred .* phi_pred;
+    q_pred = phi_pred - mu_pred .* phi_pred;
+
+}
+
+model {
+  // Hyper priors
+  gamma ~ normal(0,5);
+  tau ~ cauchy(0,2.5);
+
+  // Fill the matrix of group-level regression coefficients
+  
+   coef_a ~ normal(gamma,tau); 
+   coef_g ~ normal(gamma,tau); 
+   coef_m ~ normal(gamma,tau); 
+   coef_p ~ normal(gamma,tau);  
+  
+  
+  
+  // zero one inflated beta likelihood
+  for (i in 1:N) {
+    if (Y[i] == 0) {
+      target += log(p1[i]) + log1m(p2[i]);
+    } else if (Y[i] == 1) {
+      target += log(p1[i]) + log(p2[i]);
+    } else {
+      target += log1m(p1[i]) + beta_lpdf(Y[i] | p[i], q[i]);
+    }
+  }
+}
+
+
+generated quantities {
+  
+  vector[N] y_est;
+  real is_cat;
+  real is_1;
+
+  for (i in 1:N) {
+  is_cat = binomial_rng(1, p1[i]);
+  is_1 = binomial_rng(1, p2[i]);
+  
+    if (is_cat == 1) {
+      if (is_1 == 0) {
+        y_est[i] = 0;
+      }
+      else {
+        y_est[i] = 1;
+      }
+    } else {
+      y_est[i] = beta_rng(p[i], q[i]);
+    }
+  }
+  
+  vector[N_pred] y_pred;
+  real is_cat_pred;
+  real is_1_pred;
+
+  for (i_pred in 1:N_pred) {
+  is_cat_pred = binomial_rng(1, p1_pred[i_pred]);
+  is_1_pred = binomial_rng(1, p2_pred[i_pred]);
+
+    if (is_cat_pred == 1) {
+      if (is_1_pred == 0) {
+        y_pred[i_pred] = 0;
+      }
+      else {
+        y_pred[i_pred] = 1;
+      }
+    } else {
+      y_pred[i_pred] = beta_rng(p_pred[i_pred], q_pred[i_pred]);
+    }
+  }
+
+  
+  
+  
+}
+
+"
+
+```
+
+After writing the stan code, we create the data objects that will fill the model.
+
+```{r stanData}
+# Fit
+X <- DF_train%>%transmute(Intercept=1,Salary, QProd, ActBal, PassBal, Loan, 
+                          Rate, Maturity, Maturity2, DD, CPI, HPI)
+X <- as.matrix(scale(X))
+X[,"Intercept"] <- 1
+Y <- DF_train%>%pull(SMM)
+# Out of sample prediction
+X_pred <- DF_test%>%transmute(Intercept=1,Salary, QProd, ActBal, PassBal, Loan, 
+                              Rate, Maturity, Maturity2, DD, CPI, HPI)
+X_pred <- as.matrix(scale(X_pred))
+X_pred[,"Intercept"] <- 1
+Y_pred <- DF_test%>%pull(SMM)
+
+```
+
+And here we fit the stan model. We will keep it short to avoid higher computing times, so we use 1,000 samples and 4 chains.
+
+```{r stanFit,results=F}
+iter <- 1000
+chains <- 4
+zoibFit <- stan(model_code = ZOIB,
+                data = list(N = nrow(X), N_pred=nrow(X_pred),
+                            F=ncol(X), F_pred=ncol(X_pred),
+                            X=X, X_pred=X_pred,Y=Y),
+                iter=iter,
+                chains = chains,
+                cores=4,
+                init=0)
+
+
+```
+
+# Posterior Inference
+
+Here, I build a function to give a better structure to the samples from the stanfit.
+
+```{r posteriorDraws}
+list_of_draws <- rstan::extract(zoibFit)
+
+posteriorDraws_fun <- 
+function(s,c,varlist,draws){
+  n <- c*s
+  nvar <- length(varlist)
+  PosteriorDraws <- matrix(NA,nrow=(n),ncol=(nvar+2))
+  PosteriorDraws[,1:nvar] <- draws
+  PosteriorDraws[,(nvar+1)] <- rep(c(1:s),c)
+  PosteriorDraws[,(nvar+2)] <- c(rep(1,s),rep(2,s),rep(3,s),rep(4,s))
+  colnames(PosteriorDraws) <- c(varlist,"Sample","chain")
+  PosteriorDraws <- as.data.frame(PosteriorDraws)
+  return(PosteriorDraws)
+}
+varlist <- c("Intercept","Salary", "QProd", "ActBal", "PassBal", "Loan", "Rate", "Maturity", "Maturity2", "DD", "CPI", "HPI")
+s <- iter/2
+
+Alpha_posterior <- 
+posteriorDraws_fun(s=s,c=chains,varlist=varlist,draws=list_of_draws$coef_a)
+Gamma_posterior <- 
+posteriorDraws_fun(s=s,c=chains,varlist=varlist,draws=list_of_draws$coef_g)
+Mu_posterior <- 
+posteriorDraws_fun(s=s,c=chains,varlist=varlist,draws=list_of_draws$coef_m)
+
+
+```
+
+After fitting the model, the first thing that we have to check is that the samples are not autocorrelated. This can be done graphically by analysing the trace plot. In short, we want to see white noise in the plots for each chain. Then, we can also check the posterior distribution of the coefficients. I define two functions that will plot the graphs for me. 
+
+```{r posteriorPlots}
+trace_plot <- function(df){
+  p <- 
+  df%>%
+  pivot_longer(!c("Sample","chain"))%>%
+  ggplot(aes(x=Sample,y=value,color=as.factor(chain)))+
+  geom_line(alpha=0.4)+facet_wrap(~name,scales = "free")+
+  labs(color="Chain",x="",y="")
+  return(p)
+}
+
+density_plot <- function(df){
+  p <- 
+  df%>%
+  pivot_longer(!c("Sample","chain"))%>%
+  ggplot(aes(x=value))+
+  geom_density(alpha=0.4,fill="navy")+facet_wrap(~name,scales = "free")+
+    labs(x="",y="")
+  return(p)
+}
+
+
+
+```
+
+There are a lot of parameters, so I will focus on the mean fucntion of the beta distribution. We can see from the plot that the chains look mostly the same for each variable, and that the samples do not have autocorrelation. In a similar manner, the posterior distribution is unimodal an resembles a normal distribution. The other parameters have very similar characteristics.
+
+### Traceplots Mean Function (Beta)
+
+```{r tracePlot}
+trace_plot(Mu_posterior)
+```
+
+### Density Mean Function (Beta)
+
+```{r densityPlot}
+density_plot(Mu_posterior)
+```
+
+## Interpretation
+
+This model has three components, so I will split the interpretation in those. Note that we have use the same features to model each component, but you can also have different functions for each component. Also, another way of analysing the convergence of your samples is by using the Rhat. If chains have mixed well, then you will have an Rhat closer to 1. More information on the Rhat can be found [here](https://mc-stan.org/rstan/reference/Rhat.html).
+
+### Alpha component
+
+The alpha component is the binomial distribution that samples between a categorical (1, 0) or continuous output. A negative coefficient is interpreted as being more likely to have a partial curtailment, so clients with higher loans and rates, for example, are more likely to have partial curtailments at some point. Also, an accelerated economic activity is followed with more partial curtailments.
+
+
+```{r summaryStatsA}
+
+alpha_summary <- summary(zoibFit, pars = c("coef_a"), probs = c(0.025, 0.975))$summary
+rownames(alpha_summary) <- varlist
+
+
+print(alpha_summary)
+```
+
+### Gamma component
+
+The gamma component is the binomial distribution that samples between a full prepayment (1) or no prepayment (0). A positive coefficient is interpreted as being more likely to have a full prepayment, conditional on being a "categorical" draw. Then, for example, higher housing prices (HPI) are usually followed by more full curtailments, but higher consumer prices (more inflation), is followed by less curtailments.
+
+
+```{r summaryStatsG}
+
+gamma_summary <- summary(zoibFit, pars = c("coef_g"), probs = c(0.025, 0.975))$summary
+rownames(gamma_summary) <- varlist
+
+
+print(gamma_summary)
+```
+
+### Beta component
+
+The beta component is the beta distribution that samples partial curtailments. A positive coefficient is interpreted as having a higher curtailment, conditional on "having a curtailment". Then, for example, clients with higher salaries and more savings have higher curtailments, while clients with more debts (on other products) have lower curtailments. Also, more expensive loans (higher rates) are correlated with higher curtailments.
+
+```{r summaryStatsM}
+
+mu_summary <- summary(zoibFit, pars = c("coef_m"), probs = c(0.025, 0.975))$summary
+rownames(mu_summary) <- varlist
+
+
+print(mu_summary)
+```
+
+# Posterior Simulations
+
+In this final section we analyse the fit and out of sample performance of the model. The first plot is the posterior distribution of the curtilments (SMM). This shows how the posterior distributions are similar to the observed. 
+
+```{r fitPerformance}
+Y_ppd <- t(list_of_draws$y_est)
+Y_ppd_mean <- rep(0,nrow(Y_ppd))
+for(i in 1:nrow(Y_ppd)){
+  Y_ppd_mean[i] <- mean(Y_ppd[i,],na.rm = T)
+}
+
+Y_ppd_s <- as.data.frame(Y_ppd[,1:100])%>%
+  mutate(Maturity = DF_train$Maturity)%>%
+  pivot_longer(!Maturity)
+
+  ggplot()+
+  geom_density(data=Y_ppd_s,aes(x=value,color=name),alpha=0.5,size=0.5)+
+  geom_density(aes(x=DF_train$SMM),alpha=0.5,size=0.5,color="red")+
+  theme_minimal()+
+  scale_color_manual(values=rep("gray",100))+
+  theme(legend.position = "none")+
+  labs(title="Posterior Predictive Distribution, SMM",x="",y="")
+
+```
+
+Anyway, what we really needs is the prepayment curve. This is, on each month of maturity, how much was the curtailment. This next plot compares the observed prepayment curve with the curve from the mean PPD. Both are quite noisy, but are very similar.
+
+```{r fitPPC}
+
+DF_train%>%
+  transmute(Maturity,SMM,PPD=Y_ppd_mean)%>%
+  group_by(Maturity)%>%
+  summarise_all(mean)%>%
+  pivot_longer(!Maturity)%>%
+  ggplot()+geom_line(aes(x=Maturity,color=name,y=value))+
+  theme_minimal()+
+  labs(x="",y="",color="",title = "Prepayment Curve 2015-2017")
+
+
+```
+
+In a similar way, here is the density plot for the our of sample data (2018). The fit is not perfect, and we can clearly see that we are overestimating the amount of 0's in the model.
+
+```{r PPD2018}
+Y_ppd_fc <- t(list_of_draws$y_pred)
+Y_ppd_mean_fc <- rep(0,nrow(Y_ppd_fc))
+for(i in 1:nrow(Y_ppd_fc)){
+  Y_ppd_mean_fc[i] <- mean(Y_ppd_fc[i,],na.rm = T)
+}
+
+Y_ppd_fc_s <- as.data.frame(Y_ppd_fc[,1:100])%>%
+  mutate(Maturity = DF_test$Maturity)%>%
+  pivot_longer(!Maturity)
+
+  ggplot()+
+  geom_density(data=Y_ppd_fc_s,aes(x=value,color=name),alpha=0.5,size=0.5)+
+  geom_density(aes(x=DF_test$SMM),alpha=0.5,size=0.5,color="red")+
+  theme_minimal()+
+  scale_color_manual(values=rep("gray",100))+
+  theme(legend.position = "none")+
+  labs(title="Posterior Predictive Distribution 2018, SMM",x="",y="")
+
+```
+
+And here is the comparison between the predictions for 2018 and the real prepayment curve of that year. Again, we can see that the predictions are not perfect, but they do a good job on predicting the future.
+
+```{r predPPC}
+
+DF_test%>%
+  transmute(Maturity,SMM,PPD=Y_ppd_mean_fc)%>%
+  group_by(Maturity)%>%
+  summarise_all(mean)%>%
+  pivot_longer(!Maturity)%>%
+  ggplot()+geom_line(aes(x=Maturity,color=name,y=value))+
+  theme_minimal()+
+  labs(x="",y="",color="",title = "Prepayment Curve 2018")
+
+
+```
+
+## Predictive Performance
+
+Finally, we can measure how good we are at predicting the prepayments of the following year. I choose to use the Mean Absolute Error (MAE) to avoid over weighting outliers, and I also compute the Mean Relative Absolute Error (MRAE) which is just the MAE divided by the mean value of the target (SMM). As expected, the forecast error is higher than the fit error, but it is a more reasonable measurement for future forecasts.
+
+
+```{r MRAE}
+DF_train%>%
+  transmute(Maturity,SMM,PPD=Y_ppd_mean)%>%
+  group_by(Maturity)%>%
+  summarise_all(mean)%>%
+  mutate(DF = "Train")%>%
+  bind_rows(
+  DF_test%>%
+  transmute(Maturity,SMM,PPD=Y_ppd_mean_fc)%>%
+  group_by(Maturity)%>%
+  summarise_all(mean)%>%
+  mutate(DF = "Test"))%>%
+  ungroup()%>%group_by(DF)%>%
+  transmute(MAE = abs(SMM-PPD),SMM)%>%
+  summarise(MAE = mean(MAE),SMM=mean(SMM))%>%
+  mutate(MRAE = MAE/SMM)
+
+
+```

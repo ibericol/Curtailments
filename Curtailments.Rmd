@@ -2,7 +2,7 @@
 title: "Curtailments"
 author: "Luis Iberico"
 date: "2023-01-10"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
